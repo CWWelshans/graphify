@@ -24,25 +24,71 @@ from __future__ import annotations
 import json
 import re
 import sys
+import unicodedata
 from pathlib import Path
 import networkx as nx
 from .validate import validate_extraction
 
 
+# Synonym mapper for known invalid file_type values that LLM subagents commonly
+# emit. Keeps semantic intent close (markdown→document, tool→code) and falls
+# back to "concept" for any other invalid value (see #840).
+_FILE_TYPE_SYNONYMS = {
+    "markdown": "document",
+    "text": "document",
+    "tool": "code",
+    "library": "code",
+    "pattern": "concept",
+    "principle": "concept",
+    "constraint": "concept",
+    "tech": "concept",
+    "technology": "concept",
+    "data-source": "concept",
+    "data_source": "concept",
+    "gotcha": "concept",
+    "framework": "concept",
+}
+
+
 def _normalize_id(s: str) -> str:
-    """Normalize an ID string the same way extract._make_id does.
+    r"""Normalize an ID string the same way extract._make_id does.
 
     Used to reconcile edge endpoints when the LLM generates IDs with slightly
-    different punctuation or casing than the AST extractor.
+    different punctuation or casing than the AST extractor. Must stay in sync
+    with extract._make_id — NFKC normalization, \w with re.UNICODE, underscore
+    collapse, and casefold must all match (#811).
     """
-    cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", s)
-    return cleaned.strip("_").lower()
+    s = unicodedata.normalize("NFKC", s)
+    cleaned = re.sub(r"[^\w]+", "_", s, flags=re.UNICODE)
+    cleaned = re.sub(r"_+", "_", cleaned)
+    return cleaned.strip("_").casefold()
 
 
 def _norm_source_file(p: str | None) -> str | None:
     """Normalize path separators to forward slashes so Windows backslash paths
     and POSIX paths from semantic subagents resolve to the same node identity."""
     return p.replace("\\", "/") if p else p
+
+
+def edge_data(G: nx.Graph, u: str, v: str) -> dict:
+    """Return one edge attribute dict for (u, v), tolerating MultiGraph.
+
+    For MultiGraph/MultiDiGraph there can be multiple parallel edges;
+    this returns the first one (sufficient for callers that only need
+    relation/confidence for rendering). Fixes #796.
+    """
+    raw = G[u][v]
+    if isinstance(G, (nx.MultiGraph, nx.MultiDiGraph)):
+        return next(iter(raw.values()), {})
+    return raw
+
+
+def edge_datas(G: nx.Graph, u: str, v: str) -> list[dict]:
+    """Return every edge attribute dict for (u, v); always a list."""
+    raw = G[u][v]
+    if isinstance(G, (nx.MultiGraph, nx.MultiDiGraph)):
+        return list(raw.values())
+    return [raw]
 
 
 def build_from_json(extraction: dict, *, directed: bool = False) -> nx.Graph:
@@ -57,7 +103,9 @@ def build_from_json(extraction: dict, *, directed: bool = False) -> nx.Graph:
 
     # Canonicalize legacy node/edge schema before validation.
     for node in extraction.get("nodes", []):
-        if isinstance(node, dict) and "source" in node and "source_file" not in node:
+        if not isinstance(node, dict):
+            continue
+        if "source" in node and "source_file" not in node:
             # Count edges that reference this node so the warning is actionable (#479)
             node_id = node.get("id", "?")
             affected_edges = sum(
@@ -71,6 +119,15 @@ def build_from_json(extraction: dict, *, directed: bool = False) -> nx.Graph:
                 file=sys.stderr,
             )
             node["source_file"] = node.pop("source")
+        # Default missing/None file_type to "concept" so legacy graph.json
+        # entries (and stub nodes preserved by `_rebuild_code` from older
+        # graphify versions that didn't always populate file_type) don't
+        # trigger spurious "invalid file_type 'None'" validator warnings (#660).
+        if node.get("file_type") in (None, ""):
+            node["file_type"] = "concept"
+        ft = node.get("file_type", "")
+        if ft and ft not in {"code", "document", "paper", "image", "rationale", "concept"}:
+            node["file_type"] = _FILE_TYPE_SYNONYMS.get(ft, "concept")
 
     errors = validate_extraction(extraction)
     # Dangling edges (stdlib/external imports) are expected - only warn about real schema errors.
@@ -128,7 +185,7 @@ def build(
     directed=True produces a DiGraph that preserves edge direction (source→target).
     directed=False (default) produces an undirected Graph for backward compatibility.
     dedup=True (default) runs entity deduplication before building the graph.
-    dedup_llm_backend: if set (e.g. "claude" or "kimi"), uses LLM to resolve
+    dedup_llm_backend: if set (e.g. "gemini", "claude", or "kimi"), uses LLM to resolve
         ambiguous pairs in the 75–92 Jaro-Winkler score zone.
 
     Extractions are merged in order. For nodes with the same ID, the last
@@ -214,25 +271,25 @@ def build_merge(
 ) -> nx.Graph:
     """Load existing graph.json, merge new chunks into it, and save back.
 
-    Never replaces — only grows (or prunes deleted-file nodes via prune_sources).
+    Never replaces - only grows (or prunes deleted-file nodes via prune_sources).
     Safe to call repeatedly: existing nodes and edges are preserved.
     """
-    from networkx.readwrite import json_graph as _jg
-
     graph_path = Path(graph_path)
     if graph_path.exists():
+        # Read JSON directly instead of going through node_link_graph().
+        # The latter rebuilds an undirected nx.Graph and then enumerating
+        # edges() yields endpoints based on node insertion order, which
+        # silently flips directional edges (e.g. `calls`) when the callee
+        # was inserted before the caller. The _src/_tgt direction-preserving
+        # attrs are popped before saving in export.py, so going through the
+        # NetworkX round-trip loses direction permanently (#760).
         data = json.loads(graph_path.read_text(encoding="utf-8"))
-        try:
-            existing_G = _jg.node_link_graph(data, edges="links")
-        except TypeError:
-            existing_G = _jg.node_link_graph(data)
-        # Reconstruct as a plain extraction dict so build() can merge it
-        existing_nodes = [{"id": n, **existing_G.nodes[n]} for n in existing_G.nodes]
-        existing_edges = [
-            {"source": u, "target": v, **d} for u, v, d in existing_G.edges(data=True)
-        ]
+        links_key = "links" if "links" in data else "edges"
+        existing_nodes = list(data.get("nodes", []))
+        existing_edges = list(data.get(links_key, []))
         base = [{"nodes": existing_nodes, "edges": existing_edges}]
     else:
+        existing_nodes = []
         base = []
 
     all_chunks = base + list(new_chunks)
@@ -245,8 +302,19 @@ def build_merge(
             if d.get("source_file") in prune_sources
         ]
         G.remove_nodes_from(to_remove)
-        if to_remove:
-            print(f"[graphify] Pruned {len(to_remove)} node(s) from deleted sources.", file=sys.stderr)
+        n_files = len(prune_sources)
+        n_nodes = len(to_remove)
+        if n_nodes:
+            print(
+                f"[graphify] Pruned {n_nodes} node(s) from {n_files} deleted source file(s).",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[graphify] {n_files} source file(s) deleted since last run — "
+                f"no matching nodes in graph, already clean.",
+                file=sys.stderr,
+            )
 
     # Safety check: refuse to shrink the graph silently (#479)
     # Skip when dedup or prune_sources is active — shrinkage is intentional there.
@@ -260,3 +328,26 @@ def build_merge(
             )
 
     return G
+
+
+def prefix_graph_for_global(G: nx.Graph, repo_tag: str) -> nx.Graph:
+    """Return a copy of G with all node IDs prefixed with repo_tag::.
+
+    Labels are preserved unchanged (for display). A 'local_id' attribute
+    is added to each node so the original ID can be recovered. Edges are
+    rewritten to match the new prefixed IDs. The 'repo' attribute is set
+    on every node.
+    """
+    relabel = {n: f"{repo_tag}::{n}" for n in G.nodes}
+    H = nx.relabel_nodes(G, relabel, copy=True)
+    for node, data in H.nodes(data=True):
+        data["repo"] = repo_tag
+        data.setdefault("local_id", node.split("::", 1)[1])
+    return H
+
+
+def prune_repo_from_graph(G: nx.Graph, repo_tag: str) -> int:
+    """Remove all nodes tagged with repo_tag from G in-place. Returns count removed."""
+    to_remove = [n for n, d in G.nodes(data=True) if d.get("repo") == repo_tag]
+    G.remove_nodes_from(to_remove)
+    return len(to_remove)

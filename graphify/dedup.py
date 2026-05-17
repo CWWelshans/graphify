@@ -103,6 +103,16 @@ def deduplicate_entities(
     Returns:
         (deduped_nodes, deduped_edges) with edges rewired to survivors
     """
+    # Guard: cross-project dedup is not supported — nodes from different repos
+    # share label names by coincidence and must never be merged by string similarity.
+    # If you need to dedup a global graph, run deduplicate_entities per-repo first.
+    repos_seen = {n.get("repo") for n in nodes if n.get("repo")}
+    if len(repos_seen) > 1:
+        raise ValueError(
+            f"deduplicate_entities: nodes span multiple repos {sorted(repos_seen)!r}. "
+            f"Cross-project dedup is disabled — run dedup per-repo before merging."
+        )
+
     if len(nodes) <= 1:
         return nodes, edges
 
@@ -223,8 +233,20 @@ def deduplicate_entities(
     deduped_edges = []
     for edge in edges:
         e = dict(edge)
-        e["source"] = remap.get(e["source"], e["source"])
-        e["target"] = remap.get(e["target"], e["target"])
+        # Tolerate "from"/"to" keys from LLM backends that don't follow the
+        # schema exactly — build_from_json normalises later but dedup runs
+        # first so bracket access would KeyError here (#803).
+        # Use explicit key presence check (not `or`) so empty-string src/tgt
+        # aren't silently replaced by the fallback key.
+        src = e["source"] if "source" in e else e.get("from")
+        tgt = e["target"] if "target" in e else e.get("to")
+        if src is None or tgt is None:
+            continue
+        e["source"] = remap.get(src, src)
+        e["target"] = remap.get(tgt, tgt)
+        # Remove legacy keys so they don't leak into edge attrs in graph.json.
+        e.pop("from", None)
+        e.pop("to", None)
         if e["source"] != e["target"]:
             deduped_edges.append(e)
 
@@ -255,11 +277,13 @@ def _llm_tiebreak(
 ) -> None:
     """Batch-resolve ambiguous pairs (score in [low, high)) via LLM."""
     try:
-        from graphify.llm import BACKENDS
-        import os
-        env_key = BACKENDS.get(backend, {}).get("env_key", "")
-        if not os.environ.get(env_key):
-            print(f"[graphify] --dedup-llm: {env_key} not set, skipping LLM tiebreaker.", flush=True)
+        from graphify.llm import BACKENDS, _format_backend_env_keys, _get_backend_api_key
+        if backend not in BACKENDS:
+            print(f"[graphify] --dedup-llm: unknown backend {backend!r}, skipping LLM tiebreaker.", flush=True)
+            return
+        if not _get_backend_api_key(backend):
+            env_keys = _format_backend_env_keys(backend)
+            print(f"[graphify] --dedup-llm: {env_keys} not set, skipping LLM tiebreaker.", flush=True)
             return
     except ImportError:
         return
@@ -285,7 +309,14 @@ def _llm_tiebreak(
 
     try:
         from graphify.llm import _call_llm
-    except ImportError:
+    except ImportError as exc:
+        # F-038: previously this silent fallback hid the fact that `_call_llm`
+        # didn't exist in `graphify.llm` at all, so `--dedup-llm` was a no-op.
+        # Surface the import failure so future regressions are visible.
+        print(
+            f"[graphify] --dedup-llm: cannot import _call_llm ({exc}); skipping LLM tiebreaker.",
+            flush=True,
+        )
         return
 
     for batch_start in range(0, len(ambiguous), batch_size):

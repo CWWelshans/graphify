@@ -1,7 +1,8 @@
 # git hook integration - install/uninstall graphify post-commit and post-checkout hooks
 from __future__ import annotations
+import configparser
 import re
-import subprocess
+import sys
 from pathlib import Path
 
 _HOOK_MARKER = "# graphify-hook-start"
@@ -68,7 +69,7 @@ _GRAPHIFY_LOG="${HOME}/.cache/graphify-rebuild.log"
 mkdir -p "$(dirname "$_GRAPHIFY_LOG")"
 echo "[graphify hook] launching background rebuild (log: $_GRAPHIFY_LOG)"
 nohup $GRAPHIFY_PYTHON -c "
-import os, sys
+import os, signal, sys
 from pathlib import Path
 
 changed_raw = os.environ.get('GRAPHIFY_CHANGED', '')
@@ -80,10 +81,17 @@ if not changed:
 print(f'[graphify hook] {len(changed)} file(s) changed - rebuilding graph...')
 
 try:
-    import os as _os
-    from graphify.watch import _rebuild_code
-    _force = _os.environ.get('GRAPHIFY_FORCE', '').lower() in ('1', 'true', 'yes')
-    _rebuild_code(Path('.'), force=_force)
+    from graphify.watch import _rebuild_code, _apply_resource_limits
+    _apply_resource_limits()
+    _timeout = int(os.environ.get('GRAPHIFY_REBUILD_TIMEOUT', '600'))
+    if _timeout > 0 and hasattr(signal, 'SIGALRM'):
+        signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError(f'graphify rebuild exceeded {_timeout}s')))
+        signal.alarm(_timeout)
+    _force = os.environ.get('GRAPHIFY_FORCE', '').lower() in ('1', 'true', 'yes')
+    _rebuild_code(Path('.'), changed_paths=changed, force=_force)
+except TimeoutError as exc:
+    print(f'[graphify hook] {exc}')
+    sys.exit(1)
 except Exception as exc:
     print(f'[graphify hook] Rebuild failed: {exc}')
     sys.exit(1)
@@ -124,12 +132,23 @@ _GRAPHIFY_LOG="${HOME}/.cache/graphify-rebuild.log"
 mkdir -p "$(dirname "$_GRAPHIFY_LOG")"
 echo "[graphify] Branch switched - launching background rebuild (log: $_GRAPHIFY_LOG)"
 nohup $GRAPHIFY_PYTHON -c "
-from graphify.watch import _rebuild_code
+from graphify.watch import _rebuild_code, _apply_resource_limits
 from pathlib import Path
-import os, sys
+import os, signal, sys
 try:
+    _apply_resource_limits()
+    _timeout = int(os.environ.get('GRAPHIFY_REBUILD_TIMEOUT', '600'))
+    if _timeout > 0 and hasattr(signal, 'SIGALRM'):
+        signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError(f'graphify rebuild exceeded {_timeout}s')))
+        signal.alarm(_timeout)
     _force = os.environ.get('GRAPHIFY_FORCE', '').lower() in ('1', 'true', 'yes')
+    # post-checkout: branch switch can touch arbitrary files; full rebuild path
+    # (no changed_paths) is correct here. The flock inside _rebuild_code still
+    # prevents pile-ups when commit + checkout fire back-to-back.
     _rebuild_code(Path('.'), force=_force)
+except TimeoutError as exc:
+    print(f'[graphify] {exc}')
+    sys.exit(1)
 except Exception as exc:
     print(f'[graphify] Rebuild failed: {exc}')
     sys.exit(1)
@@ -151,22 +170,49 @@ def _git_root(path: Path) -> Path | None:
 def _hooks_dir(root: Path) -> Path:
     """Return the git hooks directory, respecting core.hooksPath if set (e.g. Husky)."""
     try:
-        result = subprocess.run(
-            ["git", "-C", str(root), "config", "core.hooksPath"],
-            capture_output=True, text=True,
-        )
-        if result.returncode == 0:
-            custom = result.stdout.strip()
-            if custom:
-                p = Path(custom).expanduser()
-                if not p.is_absolute():
-                    p = root / p
+        cfg = configparser.RawConfigParser()
+        cfg.read(root / ".git" / "config", encoding="utf-8")
+        # configparser lowercases option names; git's hooksPath becomes hookspath
+        custom = cfg.get("core", "hookspath", fallback="").strip()
+        if custom:
+            p = Path(custom).expanduser()
+            if not p.is_absolute():
+                p = root / p
+            # Validate the resolved path stays within the repository root
+            # to prevent supply-chain attacks via malicious core.hooksPath values
+            try:
+                p.resolve().relative_to(root.resolve())
+            except ValueError:
+                pass  # Path escapes repo root; fall through to default .git/hooks
+            else:
                 p.mkdir(parents=True, exist_ok=True)
                 return p
+    except (configparser.Error, OSError) as exc:
+        # Narrow the exception (PR747-NEW-2): a bare `except Exception: pass`
+        # was hiding tampering signals (corrupt .git/config, permission flips
+        # by another tool). Surface them on stderr instead of silently
+        # falling through to the default hooks directory.
+        print(
+            f"[graphify hooks] could not read core.hooksPath from "
+            f"{root / '.git' / 'config'}: {exc}",
+            file=sys.stderr,
+        )
+    # In a linked worktree .git is a file not a directory, so constructing
+    # root/.git/hooks directly fails. Ask git for the real hooks path instead.
+    import subprocess as _sp
+    try:
+        res = _sp.run(
+            ["git", "-C", str(root), "rev-parse", "--path-format=absolute", "--git-path", "hooks"],
+            capture_output=True, text=True,
+        )
+        if res.returncode == 0:
+            d = Path(res.stdout.strip())
+            d.mkdir(parents=True, exist_ok=True)
+            return d
     except (OSError, FileNotFoundError):
         pass
     d = root / ".git" / "hooks"
-    d.mkdir(exist_ok=True)
+    d.mkdir(parents=True, exist_ok=True)
     return d
 
 
